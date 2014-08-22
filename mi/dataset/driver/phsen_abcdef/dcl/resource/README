@@ -1,0 +1,6 @@
+The parser for this driver has been finished but not tested. Note that the parsers were written without
+knowing what the control records looked like so I had to assume that a newline could occur after any given
+field. Today I got an e-mail from Paul and can see that the data is all on one line so the control regex
+and metaDataParticle _build_parsed_values can be simplified if you want. The tests use the text file in
+resource and the create_yml() function to create the YAML's, and are missing the  bad test data and test data
+containing the control records
