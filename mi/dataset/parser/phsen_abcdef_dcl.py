@@ -3,14 +3,14 @@
 """
 @package mi.dataset.parser.phsen_abcdef_dcl
 @file marine-integrations/mi/dataset/parser/phsen_abcdef_dclpy
-@author Jeremy Amundson
+@author Nick Almonte
 @brief Parser for the phsen_abcdef_dcl dataset driver
 Release notes:
 
 initial release
 """
 
-__author__ = 'Jeremy Amundson'
+__author__ = 'Nick Almonte'
 __license__ = 'Apache 2.0'
 
 import copy
@@ -18,10 +18,8 @@ import re
 import time
 
 from functools import partial
-from dateutil import parser
 
 from mi.core.log import get_logger
-log = get_logger()
 from mi.core.common import BaseEnum
 from mi.core.instrument.data_particle import DataParticle, DataParticleKey, DataParticleValue
 from mi.core.exceptions import SampleException, DatasetParserException, UnexpectedDataException, \
@@ -30,353 +28,385 @@ from mi.dataset.dataset_parser import BufferLoadingParser
 from mi.core.instrument.chunker import StringChunker
 from mi.dataset.dataset_driver import DataSetDriverConfigKeys
 
-# ASCII File with records separated by carriage return, newline, or carriage return - line feed
-NEW_LINE = r'[\n\r]+'
-DATE_REGEX = r'(\d{4}/\d{2}/\d{2})'
-TIME_REGEX = r'(\d{2}:\d{2}:\d{2}:\d{3})'
-
-START_OF_LINE_REGEX = DATE_REGEX + '\w'
-START_OF_LINE_REGEX += TIME_REGEX + '\w'
-
-START_OF_RECORD_REGEX = START_OF_LINE_REGEX + '\*\w{4}(\w{2})'
-START_OF_RECORD_MATCHER = re.compile(START_OF_LINE_REGEX)
-
-DCL_REGEX = START_OF_LINE_REGEX
-DCL_REGEX += r'\[.+\]:.*' + NEW_LINE  # [<IDENTIFIER>]:<ASCII TEXT><Line Break>
-
-FLAGS ='flags'
-
 METADATA_PARTICLE_CLASS_KEY = 'metadata_particle_class'
 # The key for the data particle class
 DATA_PARTICLE_CLASS_KEY = 'data_particle_class'
 
+log = get_logger()
+
 class DataParticleType(BaseEnum):
     """
-    The data particle types that a phsen_abcdef_dcl parser could generate
+    The data particle types that a phsen_abcdef_dcl parser may generate
     """
     METADATA_RECOVERED = 'phsen_abcdef_dcl_metadata_recovered'
     INSTRUMENT_RECOVERED = 'phsen_abcdef_dcl_instrument_recovered'
     METADATA_TELEMETERED = 'phsen_abcdef_dcl_metadata'
     INSTRUMENT_TELEMETERED = 'phsen_abcdef_dcl_instrument'
 
-def time_to_unix_time(sec_since_1904):
-    """
-    Convert between seconds since 1904 into unix time (epoch time)
-    @param sec_since_1904 ascii string of seconds since Jan 1 1904
-    @retval sec_since_1970 epoch time
-    """
-    local_dt_1904 = parser.parse("1904-01-01T00:00:00.00Z")
-    elapse_1904 = float(local_dt_1904.strftime("%s.%f"))
-    sec_since_1970 = sec_since_1904 + elapse_1904 - time.timezone
-    return sec_since_1970
-
-def gen_hex_ASCII_values(hex_text, start=0, stop=None, segment_length=2):
-    """
-    returns a generator that returns segments of pure hex-ascii text as an integer.
-    Is called by the data particles _if_checksum() and _build_parsed_values() methods
-
-    the yield statement means that this function is a generator. When called it returns
-    a generator object that, when iterated through, returns the next value specified by yield
-    """
-
-    if stop is None:
-        stop = len(hex_text)
-    for segment in range(start, stop, segment_length):
-        yield int(hex_text[segment:segment+segment_length], 16)
 
 class StateKey(BaseEnum):
     POSITION = 'position'  # hold the current file position
     START_OF_DATA = 'start_of_data'
 
-class PhsenAbcdefDclDataParticleKey(BaseEnum):
-
-    CONTROLLER_TIMESTAMP = ' dcl_controller_timestamp'
-    UNIQUE_ID = 'unique_id'
-    RECORD_TYPE = 'record_type'
-    RECORD_TIME = 'record_time'
-    VOLTAGE_BATTERY = 'voltage_battery'
-    PASSED_CHECKSUM = 'passed_checksum'
-
-
-class PhsenAbcdefDclInstrumentDataParticleKey(PhsenAbcdefDclDataParticleKey):
-    THERMISTOR_START = 'thermistor_start'
-    REFERENCE_LIGHT_MEASUREMENTS = 'reference_light_measurements'
-    LIGHT_MEASUREMENTS = 'light_measurements'
-    THERMISTOR_END = 'thermistor_end'
-
-PH_REGEX = START_OF_RECORD_REGEX
-PH_REGEX += r'(?P<' + PhsenAbcdefDclDataParticleKey.UNIQUE_ID + '>\x{2})'  # ID
-PH_REGEX += r'E7'  # length
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.RECORD_TYPE + '>0A)'  # type
-PH_REGEX += r'(?P<' + PhsenAbcdefDclDataParticleKey.RECORD_TIME + '>\x{8})(?:' + \
-            NEW_LINE + START_OF_LINE_REGEX + ')?'  # time
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.THERMISTOR_START + '>\x{4})(?:' + \
-            NEW_LINE + START_OF_LINE_REGEX + ')?'  # starting thermistor
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.REFERENCE_LIGHT_MEASUREMENTS + \
-            '>(\x{16})(' + NEW_LINE + START_OF_LINE_REGEX + ')?{4})'  # reference light measurements
-# The controller timestamp is the last timestamp in the record, which is inside the rlm,
-# therefore they must be retrieved at the same time. Note that the capture group for the timestamp
-# only captures the last match
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.LIGHT_MEASUREMENTS + \
-            '>(( \x{16})' + NEW_LINE + '(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.CONTROLLER_TIMESTAMP + '>'\
-            + START_OF_LINE_REGEX + ')?){23})'  # light measurements and controller timestamp
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.VOLTAGE_BATTERY + '\x{4})'  # battery voltage
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.THERMISTOR_END + '\x{4})'  # thermistor end
-PH_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.PASSED_CHECKSUM + '\x{2})'  # passed checksum
-
-PH_MATCHER = re.compile(PH_REGEX)
-
-
-class PhsenAbcdefDclInstrumentDataParticle(DataParticle):
-    """
-    Class for parsing data from the phsen_abcdef ph data set
-    """
-
-    _encoding_rules = [(PhsenAbcdefDclInstrumentDataParticleKey.CONTROLLER_TIMESTAMP, str),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.UNIQUE_ID, int),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.RECORD_TYPE, int),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.RECORD_TIME, int),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.THERMISTOR_START, int),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.REFERENCE_LIGHT_MEASUREMENTS, list),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.LIGHT_MEASUREMENTS, list),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.VOLTAGE_BATTERY, int),
-                       (PhsenAbcdefDclInstrumentDataParticleKey.PASSED_CHECKSUM, int)]
-
-    def __init__(self, raw_data,
-                 port_timestamp=None,
-                 internal_timestamp=None,
-                 preferred_timestamp=DataParticleKey.PORT_TIMESTAMP,
-                 quality_flag=DataParticleValue.OK,
-                 new_sequence=None):
-        super(PhsenAbcdefDclInstrumentDataParticle, self).__init__(raw_data,
-                                                                   port_timestamp,
-                                                                   internal_timestamp,
-                                                                   preferred_timestamp,
-                                                                   quality_flag,
-                                                                   new_sequence)
-
-        sec_since_1904 = int(self.raw_data[PhsenAbcdefDclDataParticleKey.CONTROLLER_TIMESTAMP])
-        unix_time = time_to_unix_time(sec_since_1904)
-        self.set_internal_timestamp(unix_time=unix_time)
-
-
-    def _clean_rows(self, cluttered_data):
-        """
-        removes the new-lines and text from the matching data, leaving only ASCII-hex
-        """
-
-        return re.sub(NEW_LINE + START_OF_LINE_REGEX, '', cluttered_data)
-
-    def _if_checksum(self, passed_checksum):
-        """
-        verifies the checksum, which is the low byte of the sum of all the hex-Ascii bytes (2 characters)
-        excluding ID and checksum
-        """
-
-        cleaned_data = self._clean_rows(self.raw_data.group[0])
-        gen = gen_hex_ASCII_values(cleaned_data, start=2, stop=len(cleaned_data)-2)
-        calculated_checksum = 0
-
-        for i in gen:
-            calculated_checksum += i
-        calculated_checksum &= (2**8-1)  # and checksum with 11111111 in order to get last byte
-        if passed_checksum == calculated_checksum:
-            return True
-        else:
-            return False
-
-    def _build_parsed_values(self):
-        """
-        Take a record in the ph data format and turn it into
-        a particle with the instrument tag.
-        @throws SampleException If there is a problem with sample creation
-        """
-
-        result = []
-
-        try:
-        # value[1] stores the DataParticleType and value[2] stores the data type
-            for value in self._encoding_rules:
-                if value[1] == PhsenAbcdefDclInstrumentDataParticleKey.REFERENCE_LIGHT_MEASUREMENTS or \
-                            value[1] == PhsenAbcdefDclInstrumentDataParticleKey.LIGHT_MEASUREMENTS:
-
-                    cleaned_data = self._clean_rows(self.raw_data.group(value[1]))
-                    int_list = []
-                    gen = gen_hex_ASCII_values(cleaned_data, segment_length=4)
-
-                    [int_list.append(n) for n in gen]
-                    result.append(self._encode_value(value[1], int_list, value[2]))
-                elif value[1] == PhsenAbcdefDclDataParticleKey.PASSED_CHECKSUM:
-                    self._encode_value(value[1], self._if_checksum(self.raw_data.group(value[1])), value[2])
-                else:
-                    if value[2] is not int:
-                        result.append(self._encode_value(value[1], self.raw_data.group(value[1]), value(2)))
-                    else:
-                        decimal_number = int(self.raw_data.group(value[1]), 16)
-                        result.append(self._encode_value(value[1], decimal_number, value(2)))
-        except (ValueError, TypeError, IndexError) as ex:
-            log.warn("Exception when building parsed values")
-            raise RecoverableSampleException("Error (%s) while decoding parameters in data: %s" % (ex, self.raw_data))
-        return result
-
-
-class PhsenAbcdefDclInstrumentTelemeteredDataParticle(DataParticle):
-    _data_particle_type = DataParticleType.INSTRUMENT_TELEMETERED
-
-
-class PhsenAbcdefDclInstrumentRecoveredDataParticle(DataParticle):
-    _data_particle_type = DataParticleType.METADATA_RECOVERED
-
-
-class PhsenAbcdefDclMetadataDataParticleKey(PhsenAbcdefDclDataParticleKey):
-    CLOCK_ACTIVE = 'clock_active'
-    RECORDING_ACTIVE = 'recording_active'
-    RECORD_END_TIME = 'record_end_on_time'
-    RECORD_MEMORY_FULL = 'record_memory_full'
-    RECORD_END_ON_ERROR = 'record_end_on_error'
-    DATA_DOWNLOAD_OK = 'data_download_ok'
-    FLASH_MEMORY_OPEN = 'flash_memory_open'
-    BATTERY_LOW_PRESTART = 'battery_low_prestart'
-    BATTERY_LOW_MEASUREMENT = 'battery_low_measurement'
-    BATTERY_LOW_BLANK = 'battery_low_blank'
-    BATTERY_LOW_EXTERNAL = 'battery_low_external'
-    EXTERNAL_DEVICE1_FAULT = 'external_device1_fault'
-    EXTERNAL_DEVICE2_FAULT = 'external_device2_fault'
-    EXTERNAL_DEVICE3_FAULT = 'external_device3_fault'
-    FLASH_ERASED = 'flash_erased'
-    POWER_ON_INVALID = 'power_on_invalid'
-    NUM_DATA_RECORDS = 'num_data_records'
-    NUM_ERROR_RECORDS = 'num_error_records'
-    NUM_BYTES_STORED = 'num_bytes_stored'
-
-CONTROL_REGEX = START_OF_RECORD_REGEX
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclDataParticleKey.UNIQUE_ID + '>\x{2})'  # ID
-CONTROL_REGEX += r'\x{2}'  # length
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclInstrumentDataParticleKey.RECORD_TYPE + '>\x{2})'  # type
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclDataParticleKey.RECORD_TIME + '>\x{8})(?:' + \
-                 NEW_LINE + START_OF_LINE_REGEX + ')?'  # time
-CONTROL_REGEX += r'(?P<' + FLAGS + '>\x{4}(' + NEW_LINE + START_OF_LINE_REGEX + ')?'  # flags
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclMetadataDataParticleKey.NUM_DATA_RECORDS + '>\x{6})(' + \
-                 NEW_LINE + START_OF_LINE_REGEX + ')?'  # #of records
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclMetadataDataParticleKey.NUM_ERROR_RECORDS + '>\x{6})(' + \
-                 NEW_LINE + START_OF_LINE_REGEX + ')?'  # #of Errors
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclMetadataDataParticleKey.NUM_BYTES_STORED + '>\x{4})(' + \
-                 NEW_LINE + START_OF_LINE_REGEX + ')?'  # #of Bytes
-CONTROL_REGEX += r'(?P<extra>\x{6})?(?:' + NEW_LINE + START_OF_LINE_REGEX + ')?'  # #of records
-CONTROL_REGEX += r'(?P<' + PhsenAbcdefDclMetadataDataParticleKey.PASSED_CHECKSUM + '>\x{2})(' + \
-                 NEW_LINE + START_OF_LINE_REGEX + ')?'  # #of records
-
-CONTROL_MATCHER = re.compile(CONTROL_REGEX)
-
 
 class PhsenAbcdefDclMetadataDataParticle(DataParticle):
-    """
-    Class for parsing data from the phsen_abcdef control data set
-    """
 
-    _encoding_rules = [(PhsenAbcdefDclMetadataDataParticleKey.CONTROLLER_TIMESTAMP, str),
-                       (PhsenAbcdefDclMetadataDataParticleKey.UNIQUE_ID, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.RECORD_TYPE, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.RECORD_TIME, int),
-                       (FLAGS, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.NUM_DATA_RECORDS, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.NUM_ERROR_RECORDS, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.NUM_BYTES_STORED, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.VOLTAGE_BATTERY, int),
-                       (PhsenAbcdefDclMetadataDataParticleKey.PASSED_CHECKSUM, int)]
-
-    _flag_encoding_rules = [(PhsenAbcdefDclMetadataDataParticleKey.CLOCK_ACTIVE, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.RECORDING_ACTIVE, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.RECORD_END_TIME, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.RECORD_MEMORY_FULL, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.RECORD_END_ON_ERROR, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.DATA_DOWNLOAD_OK, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.FLASH_MEMORY_OPEN, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.BATTERY_LOW_PRESTART, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.BATTERY_LOW_MEASUREMENT, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.BATTERY_LOW_BLANK, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.BATTERY_LOW_EXTERNAL, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.EXTERNAL_DEVICE1_FAULT, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.EXTERNAL_DEVICE2_FAULT, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.EXTERNAL_DEVICE3_FAULT, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.FLASH_ERASED, int),
-                            (PhsenAbcdefDclMetadataDataParticleKey.POWER_ON_INVALID, int)]
-
-    def __init__(self, raw_data,
-                 port_timestamp=None,
-                 internal_timestamp=None,
-                 preferred_timestamp=DataParticleKey.PORT_TIMESTAMP,
-                 quality_flag=DataParticleValue.OK,
-                 new_sequence=None):
-        super(PhsenAbcdefDclMetadataDataParticle, self).__init__(raw_data,
-                                                                 port_timestamp,
-                                                                 internal_timestamp,
-                                                                 preferred_timestamp,
-                                                                 quality_flag,
-                                                                 new_sequence)
-
-        # use the timestamp from the sio header as internal timestamp
-        sec_since_1904 = int(self.raw_data.group(PhsenAbcdefDclInstrumentDataParticleKey.CONTROLLER_TIMESTAMP))
-        unix_time = time_to_unix_time(sec_since_1904)
-        self.set_internal_timestamp(unix_time=unix_time)
-
-    def _read_flags(self, text):
-
-        flags = int(text, 16)
-        for n in range(16):
-            result = flags & 1
-            flags >>= 1
-            yield result
-
-    def _build_parsed_values(self):
+    def _bin_to_bool(self, arg_int):
         """
-        Take a record in the control data format and turn it into
-        a particle with the metadata tag.
-        @throws SampleException If there is a problem with sample creation
+        Returns False for 0 and True for 1, raises a recoverable exception for any other argument integer input
         """
+        #log.debug("PhsenAbcdefDclMetadataDataParticle._bin_to_bool(): arg int= %s,", arg_int)
 
-        result = []
-        try:
-            for value in self._encoding_rules:
-                if value[1] == FLAGS:
-                    flags = int(self._read_flags(self.raw_data.group(FLAGS)), 16)
-                    for bit_value in self._flag_encoding_rules:
+        if arg_int == 1:
+            return True
+        elif arg_int == 0:
+            return False
+        else:
+            raise RecoverableSampleException("PhsenAbcdefDclMetadataDataParticle._bin_to_bool(): "
+                                             "Argument int was neither 0 or 1")
 
-                        result.append(self._encode_value(bit_value, flags & 1, value[2]))
-                        flags >>= 1
-                elif value[1] == PhsenAbcdefDclMetadataDataParticleKey.CONTROLLER_TIMESTAMP:
-                    n = -1
-                    found = False
-                    while not found:
-                        if re.search(self.raw_data.group(n), START_OF_LINE_REGEX):
-                            result.append(self._encode_value(value[1], self.raw_data.group(n), value[2]))
-                            found = True
-                        else:
-                            n -= 1
-                elif value[1] == PhsenAbcdefDclMetadataDataParticleKey.VOLTAGE_BATTERY:
-                    if self.raw_data.group(PhsenAbcdefDclMetadataDataParticleKey.RECORD_TYPE) == 'C0' or\
-                       self.raw_data.group(PhsenAbcdefDclMetadataDataParticleKey.RECORD_TYPE) == 'C1':
-                        result.append(self._encode_value(value[1], self.raw_data(value[1]), int))
-                    else:
-                        result.append({value[1]: None})
-                else:
-                    if value[2] is not int:
-                        result.append(self._encode_value(value[1], self.raw_data.group(value[1]), value(2)))
-                    else:
-                        decimal_number = int(self.raw_data.group(value[1]), 16)
-                        result.append(self._encode_value(value[1], decimal_number, value(2)))
-        except (ValueError, TypeError, IndexError) as ex:
-            log.warn("Exception when building parsed values")
-            raise RecoverableSampleException("Error (%s) while decoding parameters in data: %s" % (ex, self.raw_data))
-        return result
+    def _generate_particle(self):
+        """
+        Extracts PHSEN ABCDEF DCL Metadata data from raw_data.
+
+        @returns result a list of dictionaries of particle data
+        """
+        ## Per the IDD, voltage_battery data is optional and not guaranteed to be included in every CONTROL data record.
+        ## Nominal size of a metadata string without the voltage_battery data is 39 (including the #).  Voltage data
+        ## adds 4 ascii characters to that, so raw_data greater than 41 contains voltage data, anything smaller does not.
+        if len(self.raw_data) >= 41:
+            have_voltage_battery_data = True
+        else:
+            have_voltage_battery_data = False
+
+        # log.debug("PhsenAbcdefDclMetadataDataParticle._generate_particle(): raw_data len= %s and contains: %s, have_voltage_battery_data= %s ",
+        #           len(self.raw_data), self.raw_data, have_voltage_battery_data)
+
+        resultant_particle = []
+
+        unique_id_ascii_hex = self.raw_data[1:3]
+        ## convert 2 ascii (hex) chars to unsigned int
+        unique_id_int = int(unique_id_ascii_hex, 16)
+
+        record_type_ascii_hex = self.raw_data[5:7]
+        ## convert 2 ascii (hex) chars to unsigned int
+        record_type_int = int(record_type_ascii_hex, 16)
+
+        record_time_ascii_hex = self.raw_data[7:15]
+        ## convert 8 ascii (hex) chars to unsigned int
+        record_time_int = int(record_time_ascii_hex, 16)
+
+        ## TBD FLAGS
+        flags_ascii_hex = self.raw_data[15:19]
+        ## convert 4 ascii (hex) chars to ...TBD
+        flags_ascii_int = int(flags_ascii_hex, 16)
+        binary_list = [ (flags_ascii_int >> x) & 0x1 for x in range(16)]
+        # log.debug("PhsenAbcdefDclMetadataDataParticle._generate_particle(): binary_list= %s", binary_list)
+
+        clock_active = self._bin_to_bool(binary_list[0])
+        recording_active = self._bin_to_bool(binary_list[1])
+        record_end_on_time = self._bin_to_bool(binary_list[2])
+        record_memory_full = self._bin_to_bool(binary_list[3])
+        record_end_on_error = self._bin_to_bool(binary_list[4])
+        data_download_ok = self._bin_to_bool(binary_list[5])
+        flash_memory_open = self._bin_to_bool(binary_list[6])
+        battery_low_prestart = self._bin_to_bool(binary_list[7])
+        battery_low_measurement = self._bin_to_bool(binary_list[8])
+        battery_low_blank = self._bin_to_bool(binary_list[9])
+        battery_low_external = self._bin_to_bool(binary_list[10])
+        external_device1_fault = self._bin_to_bool(binary_list[11])
+        external_device2_fault = self._bin_to_bool(binary_list[12])
+        external_device3_fault = self._bin_to_bool(binary_list[13])
+        flash_erased = self._bin_to_bool(binary_list[14])
+        power_on_invalid = self._bin_to_bool(binary_list[15])
+
+        # log.debug("hsenAbcdefDclMetadataDataParticle._generate_particle(): "
+        #           "clock_active= %s, "
+        #           "recording_active= %s, "
+        #           "record_end_on_time= %s, "
+        #           "record_memory_full= %s, "
+        #           "record_end_on_error= %s, "
+        #           "data_download_ok= %s, "
+        #           "flash_memory_open= %s, "
+        #           "battery_low_prestart= %s, "
+        #           "battery_low_measurement= %s, "
+        #           "battery_low_blank= %s, "
+        #           "battery_low_external= %s, "
+        #           "external_device1_fault= %s, "
+        #           "external_device2_fault= %s, "
+        #           "external_device3_fault= %s, "
+        #           "flash_erased= %s, "
+        #           "power_on_invalid= %s",
+        #           clock_active,
+        #           recording_active,
+        #           record_end_on_time,
+        #           record_memory_full,
+        #           record_end_on_error,
+        #           data_download_ok,
+        #           flash_memory_open,
+        #           battery_low_prestart,
+        #           battery_low_measurement,
+        #           battery_low_blank,
+        #           battery_low_external,
+        #           external_device1_fault,
+        #           external_device2_fault,
+        #           external_device3_fault,
+        #           flash_erased,
+        #           power_on_invalid)
+
+        num_data_records_ascii_hex = self.raw_data[19:25]
+        ## convert 6 ascii (hex) chars to unsigned int
+        num_data_records_int = int(num_data_records_ascii_hex, 16)
+
+        num_error_records_ascii_hex = self.raw_data[25:31]
+        ## convert 6 ascii (hex) chars to unsigned int
+        num_error_records_int = int(num_error_records_ascii_hex, 16)
+
+        num_bytes_stored_ascii_hex = self.raw_data[31:37]
+        ## convert 6 ascii (hex) chars to unsigned int
+        num_bytes_stored_int = int(num_bytes_stored_ascii_hex, 16)
+
+        if have_voltage_battery_data:
+            voltage_battery_ascii_hex = self.raw_data[37:41]
+            ## convert 4 ascii (hex) chars to unsigned int
+            voltage_battery_int = int(num_bytes_stored_ascii_hex, 16)
+
+            passed_checksum_ascii_hex = self.raw_data[41:43]
+            ## convert 2 ascii (hex) chars to unsigned int
+            passed_checksum_int = int(passed_checksum_ascii_hex, 16)
+
+        else:
+            voltage_battery_int = None
+
+            passed_checksum_ascii_hex = self.raw_data[37:39]
+            ## convert 2 ascii (hex) chars to unsigned int
+            passed_checksum_int = int(passed_checksum_ascii_hex, 16)
+
+        # log.debug("PhsenAbcdefDclMetadataDataParticle._generate_particle(): unique_id_int= %s, "
+        #           "record_type_int= %s, "
+        #           "record_time_int= %s, "
+        #           "num_data_records_int= %s, "
+        #           "num_error_records_int= %s, "
+        #           "num_bytes_stored_int= %s, "
+        #           "voltage_battery_int= %s, "
+        #           "passed_checksum_int= %s", unique_id_int, record_type_int, record_time_int, num_data_records_int,
+        #           num_error_records_int, num_bytes_stored_int, voltage_battery_int, passed_checksum_int)
+
+        ## ASSEMBLE THE RESULTANT PARTICLE..
+        resultant_particle = [{'value_id': 'unique_id', 'value': unique_id_int},
+                              {'value_id': 'record_type', 'value': record_type_int},
+                              {'value_id': 'record_time', 'value': record_time_int},
+                              {'value_id': 'clock_active', 'value': clock_active},
+                              {'value_id': 'recording_active', 'value': recording_active},
+                              {'value_id': 'record_end_on_time', 'value': record_end_on_time},
+                              {'value_id': 'record_memory_full', 'value': record_memory_full},
+                              {'value_id': 'record_end_on_error', 'value': record_end_on_error},
+                              {'value_id': 'data_download_ok', 'value': data_download_ok},
+                              {'value_id': 'flash_memory_open', 'value': flash_memory_open},
+                              {'value_id': 'battery_low_prestart', 'value': battery_low_prestart},
+                              {'value_id': 'battery_low_measurement', 'value': battery_low_measurement},
+                              {'value_id': 'battery_low_blank', 'value': battery_low_blank},
+                              {'value_id': 'battery_low_external', 'value': battery_low_external},
+                              {'value_id': 'external_device1_fault', 'value': external_device1_fault},
+                              {'value_id': 'external_device2_fault', 'value': external_device2_fault},
+                              {'value_id': 'external_device3_fault', 'value': external_device3_fault},
+                              {'value_id': 'flash_erased', 'value': flash_erased},
+                              {'value_id': 'power_on_invalid', 'value': power_on_invalid},
+                              {'value_id': 'num_data_records', 'value': num_data_records_int},
+                              {'value_id': 'num_error_records', 'value': num_error_records_int},
+                              {'value_id': 'num_bytes_stored', 'value': num_bytes_stored_int},
+                              {'value_id': 'voltage_battery', 'value': voltage_battery_int},
+                              {'value_id': 'passed_checksum', 'value': passed_checksum_int}]
+
+        return resultant_particle
 
 
-class PhsenAbcdefDclMetadataTelemeteredDataParticle(PhsenAbcdefDclMetadataDataParticle):
-    _data_particle_type = DataParticleType.METADATA_TELEMETERED
+class PhsenAbcdefDclDataParticle(DataParticle):
+
+    measurement_num_of_chars = 4
+
+    def _create_light_measurements_array(self, raw_data):
+        """
+        Creates a light measurement array from raw data for a PHSEN DCL Instrument record
+        @returns list a list of light measurement values.  From the IDD: (an) array of 92 light measurements
+                      (23 sets of 4 measurements)
+        """
+        light_measurements_int = []
+
+        light_measurements_chunk = self.raw_data[83:-14]
+        light_measurements_ascii_hex = [light_measurements_chunk[i:i+self.measurement_num_of_chars]
+                                        for i in range(0, len(light_measurements_chunk),
+                                                     self.measurement_num_of_chars)]
+
+        for ascii_hex_value in light_measurements_ascii_hex:
+            light_measurements_int.append(int(ascii_hex_value, 16))
+
+        # log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): "
+        #           "light_measurements_ascii_hex= %s", light_measurements_ascii_hex)
+        # log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): "
+        #           "light_measurements_int= %s", light_measurements_int)
+
+        return light_measurements_int
+
+    def _create_reference_light_measurements_array(self, raw_data):
+        """
+        Creates a reference light measurement array from raw data for a PHSEN DCL Instrument record
+        @returns list a list of light measurement values.  From the IDD: (an) array of 16 measurements
+                      (4 sets of 4 measurements)
+        """
+        reference_light_measurements_int = []
+
+        reference_light_measurements_chunk = self.raw_data[19:-382]
+        reference_light_measurements_ascii_hex = [reference_light_measurements_chunk[i:i+self.measurement_num_of_chars]
+                                                  for i in range(0, len(reference_light_measurements_chunk),
+                                                                 self.measurement_num_of_chars)]
+
+        for ascii_hex_value in reference_light_measurements_ascii_hex:
+            reference_light_measurements_int.append(int(ascii_hex_value, 16))
+
+        # log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): "
+        #           "reference_light_measurements_ascii_hex= %s", reference_light_measurements_ascii_hex)
+        # log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): "
+        #           "reference_light_measurements_int= %s", reference_light_measurements_int)
+
+        return reference_light_measurements_int
+
+    def _generate_particle(self):
+        """
+        Extracts PHSEN ABCDEF DCL Instrument data from raw_data.
+
+        @returns result a list of dictionaries of particle data
+        """
+        #log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): self.raw_data= %s", self.raw_data)
+
+        unique_id_ascii_hex = self.raw_data[1:3]
+        ## convert 2 ascii (hex) chars to unsigned int
+        unique_id_int = int(unique_id_ascii_hex, 16)
+
+        record_type_ascii_hex = self.raw_data[5:7]
+        ## convert 2 ascii (hex) chars to unsigned int
+        record_type_int = int(record_type_ascii_hex, 16)
+
+        record_time_ascii_hex = self.raw_data[7:15]
+        ## convert 8 ascii (hex) chars to unsigned int
+        record_time_int = int(record_time_ascii_hex, 16)
+
+        thermistor_start_ascii_hex = self.raw_data[15:19]
+        ## convert 4 ascii (hex) chars to unsigned int
+        thermistor_start_int = int(thermistor_start_ascii_hex, 16)
+
+        reference_light_measurements_int = self._create_reference_light_measurements_array(self.raw_data)
+
+        light_measurements_int = self._create_light_measurements_array(self.raw_data)
+
+        voltage_battery_ascii_hex = self.raw_data[455:459]
+        ## convert 4 ascii (hex) chars to unsigned int
+        voltage_battery_int = int(voltage_battery_ascii_hex, 16)
+
+        thermistor_end_ascii_hex = self.raw_data[459:463]
+        ## convert 4 ascii (hex) chars to unsigned int
+        thermistor_end_int = int(thermistor_end_ascii_hex, 16)
+
+        passed_checksum_ascii_hex = self.raw_data[463:465]
+        ## convert 2 ascii (hex) chars to unsigned int
+        passed_checksum_int = int(passed_checksum_ascii_hex, 16)
+
+        ## ASSEMBLE THE RESULTANT PARTICLE..
+        resultant_particle = [{'value_id': 'unique_id', 'value': unique_id_int},
+                              {'value_id': 'record_type', 'value': record_type_int},
+                              {'value_id': 'record_time', 'value': record_time_int},
+                              {'value_id': 'thermistor_start', 'value': thermistor_start_int},
+                              {'value_id': 'reference_light_measurements', 'value': reference_light_measurements_int},
+                              {'value_id': 'light_measurements', 'value': light_measurements_int},
+                              {'value_id': 'voltage_battery', 'value': voltage_battery_int},
+                              {'value_id': 'thermistor_end', 'value': thermistor_end_int},
+                              {'value_id': 'passed_checksum', 'value': passed_checksum_int}]
+
+        return resultant_particle
 
 
 class PhsenAbcdefDclMetadataRecoveredDataParticle(PhsenAbcdefDclMetadataDataParticle):
+
     _data_particle_type = DataParticleType.METADATA_RECOVERED
+
+    def _build_parsed_values(self):
+        """
+        Takes a PHSenParser object and extracts PHSen DCL data from the
+        data dictionary and puts the data into a PHSen DCL Data Particle.
+
+        @returns result a list of dictionaries of particle data
+        """
+        #log.debug("PhsenAbcdefDclMetadataRecoveredDataParticle._build_parsed_values(): ENTERING")
+        resultant_particle = self._generate_particle()
+
+        log.debug("PhsenAbcdefDclMetadataRecoveredDataParticle._build_parsed_values(): resultant_particle= %s",
+                  resultant_particle)
+
+        return resultant_particle
+
+
+class PhsenAbcdefDclMetadataTelemeteredDataParticle(PhsenAbcdefDclMetadataDataParticle):
+
+    _data_particle_type = DataParticleType.METADATA_TELEMETERED
+
+    def _build_parsed_values(self):
+        """
+        Takes a PHSenParser object and extracts PHSen DCL data from the
+        data dictionary and puts the data into a PHSen DCL Data Particle.
+
+        @returns result a list of dictionaries of particle data
+        """
+        #log.debug("PhsenAbcdefDclMetadataRecoveredDataParticle._build_parsed_values(): ENTERING")
+        resultant_particle = self._generate_particle()
+
+        log.debug("PhsenAbcdefDclMetadataTelemeteredDataParticle._build_parsed_values(): resultant_particle= %s",
+                  resultant_particle)
+
+        return resultant_particle
+
+
+class PhsenAbcdefDclInstrumentRecoveredDataParticle(PhsenAbcdefDclDataParticle):
+
+    _data_particle_type = DataParticleType.INSTRUMENT_RECOVERED
+
+    def _build_parsed_values(self):
+        """
+        Takes a PHSenParser particle object and extracts PHSen DCL data from the
+        raw data and puts the data into a PHSen DCL Data Particle structure
+
+        @returns result a list of dictionaries of particle data
+        """
+        resultant_particle = self._generate_particle()
+
+        log.debug("PhsenAbcdefDclInstrumentRecoveredDataParticle._build_parsed_values(): resultant_particle= %s",
+                  resultant_particle)
+
+        return resultant_particle
+
+
+class PhsenAbcdefDclInstrumentTelemeteredDataParticle(PhsenAbcdefDclDataParticle):
+
+    _data_particle_type = DataParticleType.INSTRUMENT_TELEMETERED
+
+    def _build_parsed_values(self):
+        """
+        Takes a PHSenParser particle object and extracts PHSen DCL data from the
+        raw data and puts the data into a PHSen DCL Data Particle structure
+
+        @returns result a list of dictionaries of particle data
+        """
+        resultant_particle = self._generate_particle()
+
+        log.debug("PhsenAbcdefDclInstrumentTelemeteredDataParticle._build_parsed_values(): resultant_particle= %s",
+                  resultant_particle)
+
+        return resultant_particle
+
+
+class dataTypeEnum():
+    UNKNOWN = 0
+    INSTRUMENT = 1
+    CONTROL = 2
 
 
 class PhsenAbcdefDclParser(BufferLoadingParser):
@@ -390,10 +420,26 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                  exception_callback,
                  *args, **kwargs):
 
-        # noinspection PyArgumentList,PyArgumentList,PyArgumentList,PyArgumentList,PyArgumentList
+        # regex for first order parsing of input data from the chunker: newline
+        line_regex = re.compile(r'.*(?:\r\n|\n)')
+        # whitespace regex
+        self._whitespace_regex = re.compile(r'\s*$')
+        # instrument data regex: *
+        self._instrument_data_regex = re.compile(r'\*')
+
+        particle_classes_dict = config.get(DataSetDriverConfigKeys.PARTICLE_CLASSES_DICT)
+        self._instrument_data_particle_class = particle_classes_dict.get('data_particle_class_key')
+        self._metadata_particle_class = particle_classes_dict.get('metadata_particle_class_key')
+
+        log.debug("PhsenAbcdefDclParser.init(): DATA PARTICLE CLASS= %s",
+                  self._instrument_data_particle_class)
+        log.debug("PhsenAbcdefDclParser.init(): METADATA PARTICLE CLASS= %s",
+                  self._metadata_particle_class)
+
+
         super(PhsenAbcdefDclParser, self).__init__(config, stream_handle, state,
                                                             partial(StringChunker.regex_sieve_function,
-                                                                    regex_list=[START_OF_RECORD_REGEX]),
+                                                                    regex_list=[line_regex]),
                                                             state_callback,
                                                             publish_callback,
                                                             exception_callback,
@@ -402,24 +448,16 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
 
         self._read_state = {StateKey.POSITION: 0, StateKey.START_OF_DATA: False}
 
+        self.working_record = ""
+
+        self.in_record = False
+
+        self.latest_dcl_time = ""
+
+        self.result_particle_list = []
+
         if state:
             self.set_state(self._state)
-
-        if DataSetDriverConfigKeys.PARTICLE_CLASSES_DICT in config:
-            particle_classes_dict = config.get(DataSetDriverConfigKeys.PARTICLE_CLASSES_DICT)
-            # Set the metadata and data particle classes to be used later
-            if METADATA_PARTICLE_CLASS_KEY in particle_classes_dict and \
-                            DATA_PARTICLE_CLASS_KEY in particle_classes_dict:
-                self._data_particle_class = particle_classes_dict.get(DATA_PARTICLE_CLASS_KEY)
-                self._metadata_particle_class = particle_classes_dict.get(METADATA_PARTICLE_CLASS_KEY)
-            else:
-                log.warning(
-                    'Configuration missing metadata or data particle class key in particle classes dict')
-                raise ConfigurationException(
-                    'Configuration missing metadata or data particle class key in particle classes dict')
-        else:
-            log.warning('Configuration missing particle classes dict')
-            raise ConfigurationException('Configuration missing particle classes dict')
 
     def set_state(self, state_obj):
         """
@@ -440,6 +478,7 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         self._chunker.clean_all_chunks()
 
         # seek to the position
+        #log.debug("PhsenAbcdefDclParser._set_state(): seek to position: %d", state_obj[StateKey.POSITION])
         self._stream_handle.seek(state_obj[StateKey.POSITION])
 
     def _increment_state(self, increment):
@@ -447,7 +486,110 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         Increment the parser state
         @param increment The amount to increment the position by
         """
+        oldinc = increment
+        oldstatepos = self._read_state[StateKey.POSITION]
+
+        # log.debug("PhsenAbcdefDclParser._increment_state(): "
+        #           "Incrementing current state: %s with inc: %s", self._read_state, increment)
+
         self._read_state[StateKey.POSITION] += increment
+
+        # log.debug("PhsenAbcdefDclParser._increment_state(): "
+        #           "Current State Position is %s, + Increment of %s", oldstatepos, oldinc)
+        # log.debug("PhsenAbcdefDclParser._increment_state(): "
+        #           "NEW State Position: %s", self._read_state[StateKey.POSITION])
+
+    def _strip_logfile_line(self, logfile_line):
+        """
+        Strips any trailing newline and linefeed from the logfile line,
+        and strips the leading DLC time from the logfile line
+        """
+        ## strip off any trailing linefeed or newline hidden characters
+        working_logfile_line = self._strip_newline(logfile_line)
+
+        ## strip off the preceding 24 characters (the DCL time) of the log line
+        stripped_logfile_line = self._strip_time(working_logfile_line)
+
+        return stripped_logfile_line
+
+    def _strip_newline(self, logfile_line):
+
+        ## strip off any trailing linefeed or newline hidden characters
+        stripped_logfile_line = logfile_line.rstrip('\r\n')
+
+        log.info("PhsenAbcdefDclParser._strip_newline(): newline stripped_logfile_line= %s", stripped_logfile_line)
+
+        return stripped_logfile_line
+
+    def _strip_time(self, logfile_line):
+
+        ## strip off the preceding 24 characters of the log line
+        stripped_logfile_line = logfile_line[24:]
+
+        # save off this DLC time in case this is the last DCL time recorded before the next record begins
+        self.latest_dcl_time = logfile_line[:23]
+
+        log.info("PhsenAbcdefDclParser._strip_time(): time stripped_logfile_line= %s, latest_dcl_time= %s",
+                 stripped_logfile_line, self.latest_dcl_time)
+
+        return stripped_logfile_line
+
+    def _find(self, regex_pattern, line_to_process):
+        """
+        Determines whether the arg regex pattern appears in arg string
+        @retval boolean - none (false), memory location (true)
+        """
+        match = re.search(regex_pattern, line_to_process)
+
+        return match
+
+    def _process_instrument_data(self, working_record):
+        """
+        Determines which particle to produce, calls extract_sample to create the given particle
+        """
+        log.debug("PhsenAbcdefDclParser._process_instrument_data(): aggregate working_record size %s is %s",
+                  len(working_record), working_record)
+
+        # log.debug("PhsenAbcdefDclParser._process_instrument_data(): instrument_data_particle Params = %s",
+        #           self._instrument_data_particle_class.parameters_list)
+
+        data_type = self._determine_data_type(working_record)
+
+        if data_type is not dataTypeEnum.UNKNOWN:
+
+            if data_type is dataTypeEnum.INSTRUMENT:
+
+                ## Create particle mule (to be used later to create the instrument particle)
+                particle = self._extract_sample(self._instrument_data_particle_class, None, working_record, self.latest_dcl_time)
+
+                self.result_particle_list.append((particle, copy.copy(self._read_state)))
+
+            elif data_type is dataTypeEnum.CONTROL:
+
+                ## Create particle mule (to be used later to create the metadata particle)
+                particle = self._extract_sample(self._metadata_particle_class, None, working_record, self.latest_dcl_time)
+
+                self.result_particle_list.append((particle, copy.copy(self._read_state)))
+        else:
+            self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
+                                                                "Data Type is neither Control or Instrument"))
+
+    def _determine_data_type(self, working_record):
+
+        ## strip out the type from the working record
+        type_ascii_hex = working_record[5:7]
+        ## convert to a 16 bit unsigned int
+        type_int = int(type_ascii_hex, 16)
+
+        if type_int <= 10:
+            log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, INSTRUMENT", type_int)
+            return dataTypeEnum.INSTRUMENT
+        elif type_int >= 128:
+            log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, CONTROL", type_int)
+            return dataTypeEnum.CONTROL
+        else:
+            log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, UNKNOWN", type_int)
+            return dataTypeEnum.UNKNOWN
 
     def parse_chunks(self):
         """
@@ -457,63 +599,110 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         @retval a list of tuples with sample particles encountered in this
             parsing, plus the state. An empty list of nothing was parsed.
         """
-        result_particles = []
+        self.result_particle_list = []
+
+        # collect the non-data from the file
         (nd_timestamp, non_data, non_start, non_end) = self._chunker.get_next_non_data_with_index(clean=False)
+        # collect the data from the file
         (timestamp, chunk, start, end) = self._chunker.get_next_data_with_index(clean=True)
+
         self.handle_non_data(non_data, non_end, start)
 
         while chunk is not None:
 
-            log.info("Chunk: ****%s****", chunk)
+            log.info("PhsenAbcdefDclParser.parse_chunks(): ##############################")
+            log.info("PhsenAbcdefDclParser.parse_chunks(): Chunk = %s", chunk)
 
             self._increment_state(len(chunk))
-            if not self._read_state[StateKey.START_OF_DATA]:
 
-                log.info("In if not self._read_state[StateKey.START_OF_DATA]")
+            ## if the chunk has no data, ie only whitespace, it should be ignored
+            if self._whitespace_regex.match(chunk):
 
-                start_of_data = START_OF_RECORD_MATCHER.match(chunk)
-                if start_of_data:
-                    self._read_state[StateKey.START_OF_DATA] = True
+                log.debug("PhsenAbcdefDclParser.parse_chunks(): Only whitespace detected in record. Ignoring.")
+
+            ## chunk contains some data, parse the chunk
             else:
+                is_bracket_present = self._find(r'\[', chunk)
 
-                # if this chunk is a data match process it, otherwise it is a metadata record which is ignored
-                ph_match = PH_MATCHER.match(chunk)
-                control_match = CONTROL_MATCHER.match(chunk)
+                ## check for a * in this chunk, signaling the start of a new record
+                is_star_present = self._find(r'\*', chunk)
 
-                if ph_match:
+                ## if this chunk has a bracket it should not be processed...
+                if is_bracket_present:
+                    log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== LINE HAS A BRACKET ===!!!===")
 
-                    # particle-ize the data block received, return the record
-                    sample = self._extract_sample(self._data_particle_class,
-                                                  None, ph_match, None)
+                    ## if the chunk has a bracket AND data has been previously parsed...
+                    if self.in_record:
+                        log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== STAR FLAG IS SET ===!!!===")
 
-                    if sample:
-                        # create particle
-                        result_particles.append((sample, copy.copy(self._read_state)))
+                        ## if the aggregate working record is not empty,
+                        ## the working record is complete and a particle can now be created
+                        if len(self.working_record) > 0:
+                            log.debug("PhsenAbcdefDclParser.parse_chunks(): "
+                                      "===!!!=== Working_Record is Non-Zero - %s ===!!!===", len(self.working_record))
 
-                elif control_match:
+                            ## PROCESS WORKING STRING TO CREATE A PARTICLE
+                            self._process_instrument_data(self.working_record)
 
-                   # particle-ize the data block received, return the record
-                    sample = self._extract_sample(self._metadata_particle_class,
-                                                  None, control_match, None)
+                            ## clear out the working record (the last string that was being built)
+                            log.debug(" ## PhsenAbcdefDclParser.parse_chunks(): "
+                                      "### ### ### CLEARING WORKING RECORD ### ### ###")
 
-                    if sample:
-                        # create particle
-                        result_particles.append((sample, copy.copy(self._read_state)))
-                elif (START_OF_RECORD_MATCHER.match(chunk)).group(1) == '05' or\
-                     (START_OF_RECORD_MATCHER.match(chunk)).group(1) == '04':
-                    log.error('Co2 record found, should not be in data')
-                    raise RecoverableSampleException('CO2 record found')
+                            self.working_record = ""
+
+                    ## if the chunk has a bracket and data has NOT been previously parsed,
+                    ## do nothing (this is one of the first chunks seen by this parser)
+                    else:
+                        log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== STAR FLAG NOT SET ===!!!===")
+
+                ## if the chunk does NOT have a bracket, it contains instrument or control log data
                 else:
-                    # Non-PH or non-Control type or REGEX not matching PH/Control record
-                    error_str = 'REGEX does not match PH or Control record %s'
-                    log.warn(error_str, chunk)
-                    self._exception_callback(SampleException(error_str % chunk))
+                    log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== LINE DOES NOT HAVE A BRACKET ===!!!===")
 
+                    ## if the * character is present this is the first piece of data for an instrument or control log
+                    if is_star_present:
+                        log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== LINE HAS A STAR ===!!!===")
+
+
+                        stripped_logfile_line = self._strip_logfile_line(chunk)
+
+                        # ## strip the trailing newlines and carriage returns from the string
+                        # newline_stripped_logfile_line = self._strip_newline(chunk)
+                        # ## strip the leading DCL data/time data from the string
+                        # time_stripped_logfile_line = self._strip_time(newline_stripped_logfile_line)
+
+                        ## append time_stripped_logfile_line to working_record
+                        #self.working_record += time_stripped_logfile_line
+                        self.working_record += stripped_logfile_line
+
+                        self.in_record = True
+
+                    ## if there is no * character in this line,
+                    ## it is the next part of an instrument or control log file
+                    ## and will be appended to the previous portion of the log file
+                    else:
+                        log.debug("PhsenAbcdefDclParser.parse_chunks(): ===!!!=== LINE DOES NOT HAVE A STAR ===!!!===")
+
+                        stripped_logfile_line = self._strip_logfile_line(chunk)
+
+                        # ## strip the trailing newlines and carriage returns from the string
+                        # newline_stripped_logfile_line = self._strip_newline(chunk)
+                        # ## strip the leading DCL data/time data from the string
+                        # time_stripped_logfile_line = self._strip_time(newline_stripped_logfile_line)
+
+                        ## append time_stripped_logfile_line to working_record
+                        #self.working_record += time_stripped_logfile_line
+                        self.working_record += stripped_logfile_line
+
+            # collect the non-data from the file
             (nd_timestamp, non_data, non_start, non_end) = self._chunker.get_next_non_data_with_index(clean=False)
+            # collect the data from the file
             (timestamp, chunk, start, end) = self._chunker.get_next_data_with_index(clean=True)
+
             self.handle_non_data(non_data, non_end, start)
 
-        return result_particles
+        # publish the results
+        return self.result_particle_list
 
     def handle_non_data(self, non_data, non_end, start):
         """
@@ -525,6 +714,8 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         # we can get non_data after our current chunk, check that this chunk is before that chunk
         if non_data is not None and non_end <= start:
             log.error("Found %d bytes of unexpected non-data:%s", len(non_data), non_data)
+            log.warn("PhsenAbcdefDclParser.handle_non_data(): "
+                     "Found data in un-expected non-data from the chunker: %s", non_data)
             self._exception_callback(UnexpectedDataException("Found %d bytes of un-expected non-data:%s" %
                                                             (len(non_data), non_data)))
             self._increment_state(len(non_data))
