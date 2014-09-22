@@ -32,6 +32,33 @@ DATA_PARTICLE_CLASS_KEY = 'data_particle_class'
 
 log = get_logger()
 
+
+def _calculate_working_record_checksum(working_record):
+    """
+    Calculates the checksum of the argument ascii-hex string
+    @retval int - modulo integer checksum value of argument ascii-hex string
+    """
+    log.debug("_calculate_working_record_checksum(): string_length is %s, working_record is %s",
+              len(working_record), working_record)
+
+    checksum = 0
+
+    ## strip off the leading * and ID characters of the log line (3 characters) and
+    ## strip off the trailing Checksum characters (2 characters)
+    star_and_checksum_stripped_working_record = working_record[3:-2]
+
+    working_record_length = len(star_and_checksum_stripped_working_record)
+
+    log.debug("_calculate_working_record_checksum(): stripped working_record length is %s and now %s",
+              working_record_length, star_and_checksum_stripped_working_record)
+
+    for x in range(0, working_record_length, 2):
+        value = star_and_checksum_stripped_working_record[x:x+2]
+        checksum += int(value, 16)
+
+    return checksum % 256
+
+
 class DataParticleType(BaseEnum):
     """
     The data particle types that a phsen_abcdef_dcl parser may generate
@@ -180,6 +207,9 @@ class PhsenAbcdefDclMetadataDataParticle(DataParticle):
         ## convert 6 ascii (hex) chars to unsigned int
         num_bytes_stored_int = int(num_bytes_stored_ascii_hex, 16)
 
+        calculated_checksum = _calculate_working_record_checksum(working_record)
+
+        ## Record may not have voltage data...
         if have_voltage_battery_data:
             voltage_battery_ascii_hex = working_record[37:41]
             ## convert 4 ascii (hex) chars to unsigned int
@@ -189,12 +219,28 @@ class PhsenAbcdefDclMetadataDataParticle(DataParticle):
             ## convert 2 ascii (hex) chars to unsigned int
             passed_checksum_int = int(passed_checksum_ascii_hex, 16)
 
+            ## Per IDD, if the calculated checksum does not match the checksum in the record,
+            ## use a checksum of zero in the resultant particle
+            if passed_checksum_int != calculated_checksum:
+                checksum_final = 0
+            else:
+                checksum_final = passed_checksum_int
         else:
             voltage_battery_int = None
 
             passed_checksum_ascii_hex = working_record[37:39]
             ## convert 2 ascii (hex) chars to unsigned int
             passed_checksum_int = int(passed_checksum_ascii_hex, 16)
+
+            ## Per IDD, if the calculated checksum does not match the checksum in the record,
+            ## use a checksum of zero in the resultant particle
+            if passed_checksum_int != calculated_checksum:
+                checksum_final = 0
+            else:
+                checksum_final = passed_checksum_int
+
+        log.debug("### ### ###PhsenAbcdefDclMetadataDataParticle._generate_particle(): "
+                  "calculated_checksum= %s, passed_checksum_int= %s", calculated_checksum, passed_checksum_int)
 
         ## ASSEMBLE THE RESULTANT PARTICLE..
         resultant_particle = [{'value_id': 'dcl_controller_timestamp', 'value': dcl_controller_timestamp},
@@ -221,9 +267,11 @@ class PhsenAbcdefDclMetadataDataParticle(DataParticle):
                               {'value_id': 'num_error_records', 'value': num_error_records_int},
                               {'value_id': 'num_bytes_stored', 'value': num_bytes_stored_int},
                               {'value_id': 'voltage_battery', 'value': voltage_battery_int},
-                              {'value_id': 'passed_checksum', 'value': passed_checksum_int}]
+                              {'value_id': 'passed_checksum', 'value': checksum_final}]
 
         return resultant_particle
+
+
 
 
 class PhsenAbcdefDclInstrumentDataParticle(DataParticle):
@@ -329,6 +377,18 @@ class PhsenAbcdefDclInstrumentDataParticle(DataParticle):
         ## convert 2 ascii (hex) chars to unsigned int
         passed_checksum_int = int(passed_checksum_ascii_hex, 16)
 
+        calculated_checksum = _calculate_working_record_checksum(working_record)
+
+        # log.debug("### ### ###PhsenAbcdefDclInstrumentDataParticle._generate_particle(): "
+        #           "calculated_checksum= %s, passed_checksum_int= %s", calculated_checksum, passed_checksum_int)
+
+        ## Per IDD, if the calculated checksum does not match the checksum in the record,
+        ## use a checksum of zero in the resultant particle
+        if passed_checksum_int != calculated_checksum:
+            checksum_final = 0
+        else:
+            checksum_final = passed_checksum_int
+
         ## ASSEMBLE THE RESULTANT PARTICLE..
         resultant_particle = [{'value_id': 'dcl_controller_timestamp', 'value': dcl_controller_timestamp},
                               {'value_id': 'unique_id', 'value': unique_id_int},
@@ -339,7 +399,7 @@ class PhsenAbcdefDclInstrumentDataParticle(DataParticle):
                               {'value_id': 'light_measurements', 'value': light_measurements_list_int},
                               {'value_id': 'voltage_battery', 'value': voltage_battery_int},
                               {'value_id': 'thermistor_end', 'value': thermistor_end_int},
-                              {'value_id': 'passed_checksum', 'value': passed_checksum_int}]
+                              {'value_id': 'passed_checksum', 'value': checksum_final}]
 
         return resultant_particle
 
@@ -560,22 +620,6 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
 
         return match
 
-    def _calculate_working_record_checksum(self, working_record, string_length):
-        """
-        Calculates the checksum of the argument ascii-hex string
-        @retval int - integer checksum value of argument ascii-hex string
-        """
-        checksum = 0
-
-        for x in range(0, string_length, 2):
-            value = working_record[x:x+2]
-            checksum += int(value, 16)
-
-        log.debug("PhsenAbcdefDclParser._calculate_working_record_checksum(): Checksum is %s for %s",
-                  checksum, working_record)
-
-        return checksum
-
     def _process_instrument_data(self, working_record):
         """
         Determines which particle to produce, calls extract_sample to create the given particle
@@ -583,9 +627,14 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         log.debug("PhsenAbcdefDclParser._process_instrument_data(): aggregate working_record size %s is %s",
                   len(working_record), working_record)
 
+        ## this size includes the leading * character
         instrument_record_length = 465
 
-        control_record_length = 39
+        ## this size includes the leading * character
+        control_record_length_without_voltage_battery = 39
+
+        ## this size includes the leading * character
+        control_record_length_with_voltage_battery = 43
 
         data_type = self._determine_data_type(working_record)
 
@@ -598,11 +647,11 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
 
             if data_type is dataTypeEnum.INSTRUMENT:
 
+                log.debug("PhsenAbcdefDclParser._process_instrument_data(): "
+                          "Record ID is INSTRUMENT")
+
                 ## Per the IDD, if the candidate data is not the proper size, throw a recoverable exception
                 if len(working_record) == instrument_record_length:
-
-                    #checksum = self._calculate_working_record_checksum(working_record, instrument_record_length)
-
 
                     ## Create particle mule (to be used later to create the instrument particle)
                     particle = self._extract_sample(self._instrument_data_particle_class, None, particle_data, self.latest_dcl_time)
@@ -610,12 +659,17 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                     self.result_particle_list.append((particle, copy.copy(self._read_state)))
                 else:
                     self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
-                                                                "Size of data record is not the length of an instrument data record"))
+                                                                        "Size of data record is not the length of an instrument data record"))
 
             elif data_type is dataTypeEnum.CONTROL:
 
+                log.debug("PhsenAbcdefDclParser._process_instrument_data(): "
+                          "Record ID is CONTROL")
+
                 ## Per the IDD, if the candidate data is not the proper size, throw a recoverable exception
-                if len(working_record) == control_record_length:
+                if len(working_record) == control_record_length_without_voltage_battery or \
+                                len(working_record) == control_record_length_with_voltage_battery:
+
                     ## Create particle mule (to be used later to create the metadata particle)
                     particle = self._extract_sample(self._metadata_particle_class, None, particle_data, self.latest_dcl_time)
 
@@ -624,6 +678,9 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                     self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
                                                                 "Size of data record is not the length of a control data record"))
         else:
+            log.debug("PhsenAbcdefDclParser._process_instrument_data(): "
+                      "Record is neither instrument or control, throwing exception")
+
             self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
                                                                 "Data Type is neither Control or Instrument"))
 
@@ -634,10 +691,10 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         ## convert to a 16 bit unsigned int
         type_int = int(type_ascii_hex, 16)
 
-        if type_int <= 10:
+        if type_int == 10:
             log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, INSTRUMENT", type_int)
             return dataTypeEnum.INSTRUMENT
-        elif type_int >= 128:
+        elif 128 <= type_int <= 255:
             log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, CONTROL", type_int)
             return dataTypeEnum.CONTROL
         else:
@@ -758,6 +815,9 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         @param non_end ending index of the non_data chunk
         @param start start index of the next data chunk
         """
+
+        #log.debug("PhsenAbcdefDclParser.handle_non_data(): non_data= %s", non_data)
+
         # we can get non_data after our current chunk, check that this chunk is before that chunk
         if non_data is not None and non_end <= start:
             log.error("Found %d bytes of unexpected non-data:%s", len(non_data), non_data)
