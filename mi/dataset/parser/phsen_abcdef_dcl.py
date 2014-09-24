@@ -38,8 +38,8 @@ def _calculate_working_record_checksum(working_record):
     Calculates the checksum of the argument ascii-hex string
     @retval int - modulo integer checksum value of argument ascii-hex string
     """
-    log.debug("_calculate_working_record_checksum(): string_length is %s, working_record is %s",
-              len(working_record), working_record)
+    # log.debug("_calculate_working_record_checksum(): string_length is %s, working_record is %s",
+    #           len(working_record), working_record)
 
     checksum = 0
 
@@ -49,8 +49,8 @@ def _calculate_working_record_checksum(working_record):
 
     working_record_length = len(star_and_checksum_stripped_working_record)
 
-    log.debug("_calculate_working_record_checksum(): stripped working_record length is %s and now %s",
-              working_record_length, star_and_checksum_stripped_working_record)
+    # log.debug("_calculate_working_record_checksum(): stripped working_record length is %s",
+    #           working_record_length)
 
     for x in range(0, working_record_length, 2):
         value = star_and_checksum_stripped_working_record[x:x+2]
@@ -698,7 +698,7 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
             log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, CONTROL", type_int)
             return dataTypeEnum.CONTROL
         else:
-            log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, UNKNOWN", type_int)
+            log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, either C02 or UNKNOWN", type_int)
             return dataTypeEnum.UNKNOWN
 
     def parse_chunks(self):
