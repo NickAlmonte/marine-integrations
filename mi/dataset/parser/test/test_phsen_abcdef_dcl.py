@@ -51,14 +51,16 @@ RESOURCE_PATH = os.path.join(Config().base_dir(), 'mi', 'dataset', 'driver', 'ph
 ## 1 record without bsttery_voltage, 1 record with battery_voltage
 ##
 ## phsen_dcl_startOfDay.log
-## 1 Instrument record (incomplete, clipped at the beginning due to the start of the day)
+## 1 partial Instrument record (it is clipped at the beginning of the record due to the start of the day)
 ##
 ## phsen_dcl_endOfDay.log
-## 1 Instrument record (incomplete, clipped before the end due to the end of the day)
+## 1 partial Instrument record (it is clipped before the end of the record due to the end of the day)
 ##
 ## phsen_dcl_noData.log
 ## No instrument or control data, all lines with bracketed DCL entered data
 ##
+## phsen_dcl_startOfDay_plusOneGoodRecord.log
+## starts with a start-of-day clipped/patial record, then ends with a complete instrument record
 
 INPUT_LOG_FILE_01 = 'CE01ISSM-D00001-dcl35-phsen2-20140424.phsen2.log'
 INPUT_LOG_FILE_02 = 'phsen_dcl_large.log'
@@ -68,29 +70,24 @@ INPUT_LOG_FILE_05 = 'phsen_dcl_withBatteryAndWithoutBattery.log'
 INPUT_LOG_FILE_06 = 'phsen_dcl_startOfDay.log'
 INPUT_LOG_FILE_07 = 'phsen_dcl_endOfDay.log'
 INPUT_LOG_FILE_08 = 'phsen_dcl_noData.log'
+INPUT_LOG_FILE_09 = 'phsen_dcl_startOfDay_plusOneGoodRecord.log'
 
-INPUT_LOG_FILE_01_RESULTS = 'CE01ISSM-D00001-dcl35-phsen2 20140424.phsen2.yml'
-INPUT_LOG_FILE_02_RESULTS = 'phsen_dcl_large.yml'
-INPUT_LOG_FILE_03_RESULTS = 'phsen_dcl_bad_checksum.yml'
-INPUT_LOG_FILE_04_RESULTS = 'phsen_dcl_co2_type.yml'
-INPUT_LOG_FILE_05_RESULTS = 'phsen_dcl_withBatteryAndWithoutBattery.yml'
-INPUT_LOG_FILE_06_RESULTS = 'phsen_dcl_startOfDay.yml'
-INPUT_LOG_FILE_07_RESULTS = 'phsen_dcl_endOfDay.yml'
-INPUT_LOG_FILE_08_RESULTS = 'phsen_dcl_noData.yml'
+INPUT_LOG_FILE_01_YML_TELEMETERED = 'CE01ISSM-D00001-dcl35-phsen2_20140424.phsen2-TELEMETERED.yml'
+INPUT_LOG_FILE_01_YML_RECOVERED = 'CE01ISSM-D00001-dcl35-phsen2_20140424.phsen2-RECOVERED.yml'
+INPUT_LOG_FILE_02_YML_TELEMETERED = 'phsen_dcl_large-TELEMETERED.yml'
+INPUT_LOG_FILE_02_YML_RECOVERED = 'phsen_dcl_large-RECOVERED.yml'
+INPUT_LOG_FILE_03_YML_TELEMETERED = 'phsen_dcl_bad_checksum-TELEMETERED.yml'
+INPUT_LOG_FILE_03_YML_RECOVERED = 'phsen_dcl_bad_checksum-RECOVERED.yml'
+INPUT_LOG_FILE_05_YML_TELEMETERED = 'phsen_dcl_withBatteryAndWithoutBattery-TELEMETERED.yml'
+INPUT_LOG_FILE_05_YML_RECOVERED = 'phsen_dcl_withBatteryAndWithoutBattery-RECOVERED.yml'
+INPUT_LOG_FILE_06_YML_TELEMETERED = 'phsen_dcl_startOfDay-TELEMETERED.yml'
+INPUT_LOG_FILE_06_YML_RECOVERED = 'phsen_dcl_startOfDay-RECOVERED.yml'
+INPUT_LOG_FILE_07_YML_TELEMETERED = 'phsen_dcl_endOfDay-TELEMETERED.yml'
+INPUT_LOG_FILE_07_YML_RECOVERED = 'phsen_dcl_endOfDay-RECOVERED.yml'
+INPUT_LOG_FILE_09_YML_TELEMETERED = 'phsen_dcl_startOfDay_plusOneGoodRecord-TELEMETERED.yml'
+INPUT_LOG_FILE_09_YML_RECOVERED = 'phsen_dcl_startOfDay_plusOneGoodRecord-RECOVERED.yml'
 
-RECOVERED_TEXT = 'CE01ISSM-D00001-dcl35-phsen2-20140424.phsen2-2recordsOnly.log'
-RECOVERED_TEXT2 = 'CE01ISSM-D00001-dcl35-phsen2 20140424.phsen2-incControlRecord.log'
-RECOVERED_TEXT3 = 'PHSEL_DCL---2inst2ctrl.log'
-RECOVERED_TEXT4 = 'phsen_dcl_co2_type.log'
 
-TELEMETERED_TEXT = RECOVERED_TEXT
-BAD_RECOVERED_TEXT = None  #to be added
-
-RECOVERED_RESULTS = 'phsen_recovered.yml'
-#TELEMETERED_RESULTS = # YAML name here
-#BAD_RECOVERED_RESULTS = # YAML name here
-
-# move to driver after unit tests are done
 class DataTypeKey(BaseEnum):
 
     PHSEN_ABCDEF_DCL_RECOVERED = 'phsen_abcedf_dcl_recovered'
@@ -108,27 +105,65 @@ class ParserUnitTestCase(MiUnitTestCase):
         self.assertTrue(rs.verify(particles),
             msg='Failed Unit test data validation')
 
+
 class ParserIntTestCase(MiIntTestCase):
     pass
+
 
 @attr('UNIT', group='mi')
 class PhsenAbcdefDclParserUnitTestCase(ParserUnitTestCase):
     """
     phsen_abcdef_dcl Parser unit test suite
     """
+    def create_rec_parser(self, file_handle, new_state=None):
+        """
+        This function creates a PhsenAbcdefDcl parser for recovered data.
+        """
+        return PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
+                                    None, file_handle,
+                                    self.rec_state_callback, self.rec_pub_callback,
+                                    self.rec_exception_callback)
 
-    def state_callback(self, state, file_ingested):
+    def create_tel_parser(self, file_handle, new_state=None):
+        """
+        This function creates a PhsenAbcdefDcl parser for telemetered data.
+        """
+        return PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
+                                    None, file_handle,
+                                    self.tel_state_callback, self.tel_pub_callback,
+                                    self.tel_exception_callback)
+
+    def open_file(self, filename):
+
+        return open(os.path.join(RESOURCE_PATH, filename), mode='r')
+
+    def rec_state_callback(self, state, file_ingested):
         """ Call back method to watch what comes in via the position callback """
-        self.state_callback_value = state
-        self.file_ingested_value = file_ingested
+        self.rec_state_callback_value = state
+        self.rec_file_ingested_value = file_ingested
 
-    def pub_callback(self, pub):
+    def tel_state_callback(self, state, file_ingested):
+        """ Call back method to watch what comes in via the position callback """
+        self.tel_state_callback_value = state
+        self.tel_file_ingested_value = file_ingested
+
+    def rec_pub_callback(self, pub):
         """ Call back method to watch what comes in via the publish callback """
-        self.publish_callback_value = pub
+        self.rec_publish_callback_value = pub
 
-    def exception_callback(self, exception):
-        """ Callback method to watch what comes in via the exception callback """
-        self.exception_callback_value = exception
+    def tel_pub_callback(self, pub):
+        """ Call back method to watch what comes in via the publish callback """
+        self.tel_publish_callback_value = pub
+
+    def rec_exception_callback(self, exception):
+        """ Call back method to watch what comes in via the exception callback """
+        self.rec_exception_callback_value = exception
+        self.rec_exceptions_detected += 1
+
+    def tel_exception_callback(self, exception):
+        """ Call back method to watch what comes in via the exception callback """
+        self.tel_exception_callback_value = exception
+        self.tel_exceptions_detected += 1
 
     def setUp(self):
 
@@ -153,13 +188,32 @@ class PhsenAbcdefDclParserUnitTestCase(ParserUnitTestCase):
             },
         }
 
-        # Define test data particles and their associated timestamps which will be
-        # compared with returned results
+        self.rec_state_callback_value = None
+        self.rec_file_ingested_value = False
+        self.rec_publish_callback_value = None
+        self.rec_exception_callback_value = None
+        self.rec_exceptions_detected = 0
+        self.tel_state_callback_value = None
+        self.tel_file_ingested_value = False
+        self.tel_publish_callback_value = None
+        self.tel_exception_callback_value = None
+        self.tel_exceptions_detected = 0
+        self.maxDiff = None
 
-        self.file_ingested_value = None
-        self.state_callback_value = None
-        self.publish_callback_value = None
-        self.exception_callback_value = None
+    def create_yml(self):
+        """
+        This is added as a testing helper, not actually as part of the parser tests. This utility creates a yml file
+        """
+
+        fid = open(os.path.join(RESOURCE_PATH, INPUT_LOG_FILE_02), 'r')
+        #self.stream_handle = fid
+
+        ## Create YML for data
+        parser = self.create_tel_parser(fid)
+        particles = parser.get_records(12)
+        self.particle_to_yml(particles, 'phsen_dcl_large-TELEMETERED.yml')
+
+        fid.close()
 
     def particle_to_yml(self, particles, filename, mode='w'):
         """
@@ -191,450 +245,347 @@ class PhsenAbcdefDclParserUnitTestCase(ParserUnitTestCase):
                     fid.write('    %s: %s\n' % (val.get('value_id'), val.get('value')))
         fid.close()
 
-    def get_dict_from_yml(self, filename):
-        """
-        This utility routine loads the contents of a yml file
-        into a dictionary
-        """
-
-        fid = open(os.path.join(RESOURCE_PATH, filename), 'r')
-        result = yaml.load(fid)
-        fid.close()
-
-        log.debug(" ## ## ## ## ## ## ## ## ## ## PhsenAbcdefDclParserUnitTestCase.get_dict_from_yml(): yaml result= %s", result)
-
-        if result is None:
-            raise SampleException('dict is None')
-
-        return result
-
-    def create_yml(self):
-        """
-        This utility creates a yml file
-        """
-
-        fid = open(os.path.join(RESOURCE_PATH, BAD_RECOVERED_TEXT), 'r')
-
-        self.stream_handle = fid
-        self.parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED), None, self.stream_handle,
-                                           self.state_callback, self.pub_callback, self.exception_callback)
-
-        particles = self.parser.get_records(4)
-
-        self.particle_to_yml(particles, 'phsen_recovered.yml')
-        fid.close()
-
 ########################################################################################################################
 ########################################################################################################################
 
-    def test_IDD_file_recovered(self):
-        """
-        Verifies the 10 Instrument particles from the log file attached to the PHSEN DCL IDD are produced
-        """
-        file_path = os.path.join(RESOURCE_PATH, INPUT_LOG_FILE_01)
-        stream_handle = open(file_path, 'r')
-
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
-
-        particles = parser.get_records(10)
-
-        self.assertTrue(len(particles) == 10)
-
-        stream_handle.close()
-
-    def test_IDD_file_telemetered(self):
-        """
-        Verifies the 10 Instrument particles from the log file attached to the PHSEN DCL IDD are produced
-        """
-        file_path = os.path.join(RESOURCE_PATH, INPUT_LOG_FILE_01)
-        stream_handle = open(file_path, 'r')
-
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
-
-        particles = parser.get_records(10)
-
-        for particle in particles:
-            particle.generate_dict()
-
-        self.assertTrue(len(particles) == 10)
-
-        stream_handle.close()
-
+##DONE
     def test_bad_checksum_recovered(self):
         """
         Verifies the 2 particles (1 instrument, 1 control) from a log file where both particle
         data sets have a bad checksum
         """
-        file_path = os.path.join(RESOURCE_PATH, INPUT_LOG_FILE_03)
-        stream_handle = open(file_path, 'r')
+         ## BAD CHECKSUM (2 particles)
+        input_file = INPUT_LOG_FILE_03
+        expected_particles = 2
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                      None, stream_handle,
-                                      self.state_callback, self.pub_callback,
-                                      self.exception_callback)
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_03_YML_RECOVERED)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        particles = parser.get_records(2)
-
-        # for particle in particles:
-        #     particle.generate_dict()
-            #log.debug("PHSEN TEST MODULE: particle= %s", particle.raw_data)
-
-        test_data = self.get_dict_from_yml(INPUT_LOG_FILE_03_RESULTS)
-
-
-
-        for n in range(2):
-            log.debug("## ## ## ## ## ## ## ## test_bad_checksum_recovered(): yml particle 1= %s", test_data['data'][n])
-            self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-
-
-
-
-    def test_NICK1(self):
+##DONE
+    def test_bad_checksum_telemetered(self):
         """
-        retrieves and verifies the first 3 particles
+        Verifies the 2 particles (1 instrument, 1 control) from a log file where both particle
+        data sets have a bad checksum
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT)
-        stream_handle = open(file_path, 'r')
+         ## BAD CHECKSUM (2 particles)
+        input_file = INPUT_LOG_FILE_03
+        expected_particles = 2
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_03_YML_TELEMETERED)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                      None, stream_handle,
-                                      self.state_callback, self.pub_callback,
-                                      self.exception_callback)
-
-        # eventually calls parse_chunks and returns a
-        particles = parser.get_records(3)
-
-        for particle in particles:
-            particle.generate_dict()
-            #log.debug("PHSEN TEST MODULE: particle= %s", particle.raw_data)
-
-        # test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-        # for n in range(2):
-        #     self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_NICK2(self):
+##DONE
+    def test_co2_type_telemetered(self):
         """
-        retrieves and verifies the first 11 particles
+        Verifies that no particles are created from a log file that includes data from a log file that includes C02
+        instrument data
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT2)
-        stream_handle = open(file_path, 'r')
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_04
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                                      None, stream_handle,
-                                      self.state_callback, self.pub_callback,
-                                      self.exception_callback)
-
-        # eventually calls parse_chunks and returns a
-        particles = parser.get_records(11)
-
-        for particle in particles:
-            particle.generate_dict()
-            #log.debug("PHSEN TEST MODULE: particle= %s", particle.raw_data)
-
-        # test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-        # for n in range(2):
-        #     self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_NICK3(self):
+##DONE
+    def test_co2_type_recovered(self):
         """
-        retrieves and verifies the first 4 particles
+        Verifies that no particles are created from a log file that includes data from a log file that includes C02
+        instrument data
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT3)
-        stream_handle = open(file_path, 'r')
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_04
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                                      None, stream_handle,
-                                      self.state_callback, self.pub_callback,
-                                      self.exception_callback)
-
-        # eventually calls parse_chunks and returns a
-        particles = parser.get_records(4)
-
-        for particle in particles:
-            particle.generate_dict()
-            #log.debug("PHSEN TEST MODULE: particle= %s", particle.raw_data)
-
-        # test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-        # for n in range(2):
-        #     self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_NICK4(self):
+##DONE
+    def test_noData_telemetered(self):
         """
-        retrieves and verifies the first 1 particles
+        Verifies that no particles are created from a log file that includes no data
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT4)
-        stream_handle = open(file_path, 'r')
+         ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_08
+        expected_particles = 0
+        total_records = expected_particles + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.tel_exceptions_detected, 0)
+        in_file.close()
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                                      None, stream_handle,
-                                      self.state_callback, self.pub_callback,
-                                      self.exception_callback)
-
-        # eventually calls parse_chunks and returns a
-        particles = parser.get_records(1)
-
-        for particle in particles:
-            particle.generate_dict()
-            #log.debug("PHSEN TEST MODULE: particle= %s", particle.raw_data)
-
-        # test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-        # for n in range(2):
-        #     self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_simple(self):
+##DONE
+    def test_noData_recovered(self):
         """
-        retrieves and verifies the first 6 particles
+        Verifies that no particles are created from a log file that includes no data
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT)
-        stream_handle = open(file_path, 'r')
+         ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_08
+        expected_particles = 0
+        total_records = expected_particles + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.rec_exceptions_detected, 0)
+        in_file.close()
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
-
-        particles = parser.get_records(6)
-
-        for particle in particles:
-            particle.generate_dict()
-
-        test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-        for n in range(6):
-            self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_get_many(self):
+##DONE
+    def test_endOfDay_telemetered(self):
         """
-        get 10 particles, verify results, get 10 more particles, verify results
+        Verifies that no particles are created from a log file that includes incomplete log data for a single instrument
+        data record to span multiple files, when the record is being written out as the day changes
         """
-        file_path = os.path.join(RESOURCE_PATH, TELEMETERED_TEXT)
-        stream_handle = open(file_path, 'rb')
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_07
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        particles = parser.get_records(10)
-
-        log.info("Num particles %s", len(particles))
-
-        for particle in particles:
-            particle.generate_dict()
-
-        test_data = self.get_dict_from_yml(TELEMETERED_RESULTS)
-        for n in range(10):
-            self.assert_result(test_data['data'][n], particles[n])
-
-        particles = parser.get_records(10)
-
-        for particle in particles:
-            particle.generate_dict()
-
-        for n in range(10):
-            self.assert_result(test_data['data'][n+10], particles[n])
-
-        stream_handle.close()
-
-    def test_long_stream(self):
+##DONE
+    def test_endOfDay_recovered(self):
         """
-        retrieve all of particles, verify the expected number, confirm results
+        Verifies that no particles are created from a log file that includes incomplete log data for a single instrument
+        data record to span multiple files, when the record is being written out as the day changes
         """
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT)
-        stream_handle = open(file_path, 'r')
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_07
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        #take in
-        particles = parser.get_records(1000)
-
-        self.assertTrue(len(particles) == 231)
-
-        test_data = self.get_dict_from_yml(RECOVERED_RESULTS)
-
-        for n in range(193):
-            self.assert_result(test_data['data'][n], particles[n])
-
-        stream_handle.close()
-
-    def test_mid_state_start(self):
+##DONE
+    def test_startOfDay_telemetered(self):
         """
-        This test makes sure that we retrieve the correct particles upon starting with an offset state.
+        Verifies that no particles are created from a log file that includes incomplete log data for a single instrument
+        data record to span multiple files, when the record is being written out as the day changes
         """
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_06
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
-        file_path = os.path.join(RESOURCE_PATH, RECOVERED_TEXT)
-        stream_handle = open(file_path, 'rb')
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        #the beginning of the 13th data particle, with metatdata read
-        initial_state = {StateKey.POSITION: 1353, StateKey.METADATA_EXTRACTED: True}
-
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                   initial_state, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
-
-        #expect to get the 2nd and 3rd instrument particles next
-        particles = parser.get_records(2)
-
-        log.debug("Num particles: %s", len(particles))
-
-        self.assertTrue(len(particles) == 2)
-
-        expected_results = self.get_dict_from_yml(RECOVERED_RESULTS)
-
-        for i in range(len(particles)):
-
-            self.assert_result(expected_results['data'][i+12], particles[i])
-
-        # now expect the state to be the end of the 14th data records and metadata sent
-        the_new_state = {StateKey.POSITION: 1537, StateKey.METADATA_EXTRACTED: True}
-        log.debug("********** expected state: %s", the_new_state)
-        log.debug("******** new parser state: %s", parser._state)
-        self.assertTrue(parser._state == the_new_state)
-
-        stream_handle.close()
-
-    def test_set_state(self):
+##DONE
+    def test_startOfDay_recovered(self):
         """
-        Test changing to a new state after initializing the parser and
-        reading data, as if new data has been found and the state has
-        changed
+        Verifies that no particles are created from a log file that includes incomplete log data for a single instrument
+        data record to span multiple files, when the record is being written out as the day changes
         """
+        ## No Data (0 particles)
+        input_file = INPUT_LOG_FILE_06
+        expected_particles = 0
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        file_path = os.path.join(RESOURCE_PATH, TELEMETERED_TEXT)
-        stream_handle = open(file_path, 'r')
-
-        expected_results = self.get_dict_from_yml(TELEMETERED_RESULTS)
-
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_TELEMETERED),
-                None, stream_handle,
-                self.state_callback, self.pub_callback,
-                self.exception_callback)
-
-        particles = parser.get_records(2)
-
-        log.debug("Num particles: %s", len(particles))
-
-        self.assertTrue(len(particles) == 2)
-
-        for i in range(len(particles)):
-            self.assert_result(expected_results['data'][i], particles[i])
-
-        # position 1453 is the byte at the start of the 14th data record
-        new_state = {StateKey.POSITION: 1453, StateKey.METADATA_EXTRACTED: True}
-
-        parser.set_state(new_state)
-
-        particles = parser.get_records(2)
-
-        self.assertTrue(len(particles) == 2)
-
-        for i in range(len(particles)):
-            self.assert_result(expected_results['data'][i + 13], particles[i])
-
-    def test_bad_data(self):
+##DONE
+    def test_phsen_dcl_startOfDay_plusOneGoodRecord_telemetered(self):
         """
-        Ensure that bad data is skipped when it exists. A variety of malformed
-        records are used in order to verify this
+        Verifies that 1 insturment particle is produced despite incomplete (start of day) data at the top of the
+        log file
         """
+         ## incomplete start of day data and good data (1 metadata particles)
+        input_file = INPUT_LOG_FILE_09
+        expected_particles = 1
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
-        file_path = os.path.join(RESOURCE_PATH, BAD_RECOVERED_TEXT)
-        stream_handle = open(file_path, 'rb')
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_09_YML_TELEMETERED)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        log.info(self.exception_callback_value)
-
-        parser = PhsenAbcdefDclParser(self.config.get(DataTypeKey.PHSEN_ABCDEF_DCL_RECOVERED),
-                                   None, stream_handle,
-                                   self.state_callback, self.pub_callback,
-                                   self.exception_callback)
-
-        particles = parser.get_records(2)
-
-        expected_results = self.get_dict_from_yml(BAD_RECOVERED_RESULTS)
-
-        self.assertTrue(len(particles) == 2)
-
-        self.assert_(isinstance(self.exception_callback_value, RecoverableSampleException))
-
-        for i in range(len(particles)):
-            self.assert_result(expected_results['data'][i], particles[i])
-
-        stream_handle.close()
-
-    def assert_result(self, test, particle):
+##DONE
+    def test_phsen_dcl_startOfDay_plusOneGoodRecord_recovered(self):
         """
-        Suite of tests to run against each returned particle and expected
-        results of the same.  The test parameter should be a dictionary
-        that contains the keys to be tested in the particle
-        the 'internal_timestamp' and 'position' keys are
-        treated differently than others but can be verified if supplied
+        Verifies that 1 insturment particle is produced despite incomplete (start of day) data at the top of the
+        log file
         """
+         ## incomplete start of day data and good data (1 metadata particles)
+        input_file = INPUT_LOG_FILE_09
+        expected_particles = 1
+        expected_exceptions = 1
+        total_records = expected_particles + expected_exceptions + 1
 
-        particle_dict = particle.generate_dict()
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_09_YML_RECOVERED)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-        #for efficiency turn the particle values list of dictionaries into a dictionary
-        particle_values = {}
-        for param in particle_dict.get('values'):
-            particle_values[param['value_id']] = param['value']
+##DONE
+    def test_withBatteryAndWithoutBattery_telemetered(self):
+        """
+        Verifies the 2 metadata particles (2 control), one with battery data and one without battery data
+        """
+         ## Battery & No Battery (2 metadata particles)
+        input_file = INPUT_LOG_FILE_05
+        expected_particles = 2
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
 
-        # compare each key in the test to the data in the particle
-        for key in test:
-            test_data = test[key]
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_05_YML_TELEMETERED)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-            #get the correct data to compare to the test
-            if key == 'internal_timestamp':
-                particle_data = particle.get_value('internal_timestamp')
-                #the timestamp is in the header part of the particle
-            elif key == 'position':
-                particle_data = self.state_callback_value['position']
-                #position corresponds to the position in the file
-            else:
-                particle_data = particle_values.get(key)
-                #others are all part of the parsed values part of the particle
+##DONE
+    def test_withBatteryAndWithoutBattery_recovered(self):
+        """
+        Verifies the 2 metadata particles (2 control), one with battery data and one without battery data
+        """
+         ## Battery & No Battery (2 metadata particles)
+        input_file = INPUT_LOG_FILE_05
+        expected_particles = 2
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
 
-            #log.debug('*** assert result: test data key = %s', key)
-            #log.debug('*** assert result: test data val = %s', test_data)
-            #log.debug('*** assert result: part data val = %s', particle_data)
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_05_YML_RECOVERED)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-            if particle_data is None:
-                #generally OK to ignore index keys in the test data, verify others
+##DONE
+    def test_large_telemetered(self):
+        """
+        Verifies the 10 instrument particles and 2 metadata (control) particles
+        """
+        ## 10 instrument, 2 metadata (control)
+        input_file = INPUT_LOG_FILE_02
+        expected_particles = 12
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
 
-                log.warning("\nWarning: assert_result ignoring test key %s, does not exist in particle", key)
-            else:
-                if isinstance(test_data, float):
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_02_YML_TELEMETERED)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
 
-                    # slightly different test for these values as they are floats.
-                    compare = numpy.abs(test_data - particle_data) <= 1e-5
-                    # log.debug('*** assert result: compare = %s', compare)
-                    self.assertTrue(compare)
-                else:
-                    # otherwise they are all ints and should be exactly equal
-                    self.assertEqual(test_data, particle_data)
+##DONE
+    def test_large_recovered(self):
+        """
+        Verifies the 10 instrument particles and 2 metadata (control) particles
+        """
+        ## 10 instrument, 2 metadata (control)
+        input_file = INPUT_LOG_FILE_02
+        expected_particles = 12
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
+
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_02_YML_RECOVERED)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()
+
+##DONE
+    def test_file_from_IDD_telemetered(self):
+        """
+        Verifies the 10 instrument particles from the log file included with the PHSEN DCL IDD
+        """
+        ## 10 instrument records
+        input_file = INPUT_LOG_FILE_01
+        expected_particles = 10
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
+
+        in_file = self.open_file(input_file)
+        parser = self.create_tel_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_01_YML_TELEMETERED)
+        self.assertEqual(self.tel_exceptions_detected, expected_exceptions)
+        in_file.close()
+
+##DONE
+    def test_file_from_IDD_recovered(self):
+        """
+        Verifies the 10 instrument particles from the log file included with the PHSEN DCL IDD
+        """
+        ## 10 instrument records
+        input_file = INPUT_LOG_FILE_01
+        expected_particles = 10
+        expected_exceptions = 0
+        total_records = expected_particles + expected_exceptions + 1
+
+        in_file = self.open_file(input_file)
+        parser = self.create_rec_parser(in_file)
+        particles = parser.get_records(total_records)
+        self.assertEqual(len(particles), expected_particles)
+        self.verify_particles(particles, RESOURCE_PATH, INPUT_LOG_FILE_01_YML_RECOVERED)
+        self.assertEqual(self.rec_exceptions_detected, expected_exceptions)
+        in_file.close()

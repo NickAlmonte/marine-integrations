@@ -15,6 +15,9 @@ __license__ = 'Apache 2.0'
 
 import copy
 import re
+import calendar
+import ntplib
+import gevent
 
 from functools import partial
 
@@ -56,7 +59,35 @@ def _calculate_working_record_checksum(working_record):
         value = star_and_checksum_stripped_working_record[x:x+2]
         checksum += int(value, 16)
 
-    return checksum % 256
+    modulo_checksum = checksum % 256
+
+    return modulo_checksum
+
+def _convert_dcl_time(latest_dcl_time):
+    """
+    Method to convert the DCL controller timestamp string to a floating point representation
+    of time in sec since 1/1/1900
+    """
+    ## example DCL Coontroller Time: 2014/04/24 00:03:16.906
+
+    ## slice each item out of the argument string and convert them to ints
+    year_int = int(latest_dcl_time[0:4])
+    month_int = int(latest_dcl_time[5:7])
+    day_int = int(latest_dcl_time[8:10])
+    hours_int = int(latest_dcl_time[11:13])
+    min_int = int(latest_dcl_time[14:16])
+    sec_int = int(latest_dcl_time[17:19])
+
+    time_tuple = (year_int, month_int, day_int, hours_int, min_int, sec_int, 0, 0, 0)
+
+    elapsed_seconds = calendar.timegm(time_tuple)
+
+    ntptimestampsetinparentparticle = ntplib.system_to_ntp_time(elapsed_seconds)
+
+    # log.debug("_convert_dcl_time(): time_tuple= %s, elapsed_seconds= %s, ntptime= %s",
+    #           time_tuple, elapsed_seconds, ntptimestampsetinparentparticle)
+
+    return elapsed_seconds
 
 
 class DataParticleType(BaseEnum):
@@ -65,8 +96,8 @@ class DataParticleType(BaseEnum):
     """
     METADATA_RECOVERED = 'phsen_abcdef_dcl_metadata_recovered'
     INSTRUMENT_RECOVERED = 'phsen_abcdef_dcl_instrument_recovered'
-    METADATA_TELEMETERED = 'phsen_abcdef_dcl_metadata'
-    INSTRUMENT_TELEMETERED = 'phsen_abcdef_dcl_instrument'
+    METADATA_TELEMETERED = 'phsen_abcdef_dcl_metadata_telemetered'
+    INSTRUMENT_TELEMETERED = 'phsen_abcdef_dcl_instrument_telemetered'
 
 
 class StateKey(BaseEnum):
@@ -87,6 +118,8 @@ class PhsenAbcdefDclMetadataDataParticle(DataParticle):
         elif arg_int == 0:
             return False
         else:
+            log.debug("PhsenAbcdefDclMetadataDataParticle._bin_to_bool(): "
+                      "Throwing RecoverableSampleException, Argument int was neither 0 or 1")
             raise RecoverableSampleException("PhsenAbcdefDclMetadataDataParticle._bin_to_bool(): "
                                              "Argument int was neither 0 or 1")
 
@@ -96,10 +129,19 @@ class PhsenAbcdefDclMetadataDataParticle(DataParticle):
 
         @returns result a list of dictionaries of particle data
         """
-        ## extract the time from the raw_data touple
+        ## extract the time from the raw_data tuple
         dcl_controller_timestamp = self.raw_data[0]
 
-        ## extract the working_record string from the raw data touple
+        ## convert the time
+        converted_time = _convert_dcl_time(dcl_controller_timestamp)
+        ## set the converted time to the particle internal timestamp
+        self.set_internal_timestamp(unix_time=converted_time)
+
+        # log.debug(" XX ## XX ## XX ## XX PhsenAbcdefDclMetadataDataParticle._generate_particle(): "
+        #           "dcl_controller_timestamp= %s, converted DCL Time= %s", dcl_controller_timestamp, converted_time)
+
+
+        ## extract the working_record string from the raw data tuple
         working_record = self.raw_data[1]
 
         # log.debug("PhsenAbcdefDclMetadataDataParticle._generate_particle(): dcl_controller_timestamp= %s, "
@@ -326,14 +368,23 @@ class PhsenAbcdefDclInstrumentDataParticle(DataParticle):
 
     def _generate_particle(self):
         """
-        Extracts PHSEN ABCDEF DCL Instrument data from the raw_data touple.
+        Extracts PHSEN ABCDEF DCL Instrument data from the raw_data tuple.
 
         @returns result a list of dictionaries of particle data
         """
         ## extract the time from the raw_data touple
         dcl_controller_timestamp = self.raw_data[0]
 
-        ## extract the working_record string from the raw data touple
+        ## convert the time
+        converted_time = _convert_dcl_time(dcl_controller_timestamp)
+        ## set the converted time to the particle internal timestamp
+        self.set_internal_timestamp(unix_time=converted_time)
+
+        log.debug(" XX ## XX ## XX ## XX PhsenAbcdefDclInstrumentDataParticle._generate_particle(): "
+                  "dcl_controller_timestamp= %s, converted DCL Time= %s", dcl_controller_timestamp, converted_time)
+
+
+        ## extract the working_record string from the raw data tuple
         working_record = self.raw_data[1]
 
         # log.debug("PhsenAbcdefDclInstrumentDataParticle._generate_particle(): dcl_controller_timestamp= %s, "
@@ -536,6 +587,34 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         if state:
             self.set_state(self._state)
 
+    def get_block(self):
+        """
+        This function overwrites the get_block function in dataset_parser.py
+        to read the entire file rather than break it into chunks.
+        Returns:
+        The length of data retrieved.
+        An EOFError is raised when the end of the file is reached.
+        """
+        # Read in data in blocks so as to not tie up the CPU.
+        BLOCK_SIZE = 1024
+        eof = False
+        data = ''
+        while not eof:
+            next_block = self._stream_handle.read(BLOCK_SIZE)
+            if next_block:
+                data = data + next_block
+                gevent.sleep(0)
+            else:
+                eof = True
+
+        if data != '':
+            self._chunker.add_chunk(data, self._timestamp)
+            self.file_complete = True
+            return len(data)
+        else:
+            self.file_complete = True
+            raise EOFError
+
     def set_state(self, state_obj):
         """
         Set the value of the state object for this parser
@@ -594,7 +673,7 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         ## strip off any trailing linefeed or newline hidden characters
         stripped_logfile_line = logfile_line.rstrip('\r\n')
 
-        log.info("PhsenAbcdefDclParser._strip_newline(): newline stripped_logfile_line= %s", stripped_logfile_line)
+        # log.info("PhsenAbcdefDclParser._strip_newline(): newline stripped_logfile_line= %s", stripped_logfile_line)
 
         return stripped_logfile_line
 
@@ -606,8 +685,8 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         # save off this DLC time in case this is the last DCL time recorded before the next record begins
         self.latest_dcl_time = logfile_line[:23]
 
-        log.info("PhsenAbcdefDclParser._strip_time(): time stripped_logfile_line= %s, latest_dcl_time= %s",
-                 stripped_logfile_line, self.latest_dcl_time)
+        # log.info("PhsenAbcdefDclParser._strip_time(): time stripped_logfile_line= %s, latest_dcl_time= %s",
+        #          stripped_logfile_line, self.latest_dcl_time)
 
         return stripped_logfile_line
 
@@ -654,12 +733,15 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                 if len(working_record) == instrument_record_length:
 
                     ## Create particle mule (to be used later to create the instrument particle)
-                    particle = self._extract_sample(self._instrument_data_particle_class, None, particle_data, self.latest_dcl_time)
+                    particle = self._extract_sample(self._instrument_data_particle_class,
+                                                    None,
+                                                    particle_data,
+                                                    self.latest_dcl_time)
 
                     self.result_particle_list.append((particle, copy.copy(self._read_state)))
                 else:
                     self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
-                                                                        "Size of data record is not the length of an instrument data record"))
+                                                                        "Throwing RecoverableSampleException, Size of data record is not the length of an instrument data record"))
 
             elif data_type is dataTypeEnum.CONTROL:
 
@@ -671,15 +753,21 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                                 len(working_record) == control_record_length_with_voltage_battery:
 
                     ## Create particle mule (to be used later to create the metadata particle)
-                    particle = self._extract_sample(self._metadata_particle_class, None, particle_data, self.latest_dcl_time)
+                    particle = self._extract_sample(self._metadata_particle_class,
+                                                    None,
+                                                    particle_data,
+                                                    self.latest_dcl_time)
 
                     self.result_particle_list.append((particle, copy.copy(self._read_state)))
                 else:
+                    log.debug("PhsenAbcdefDclParser._process_instrument_data(): "
+                              "Size of data record is not the length of a control data record")
+
                     self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
-                                                                "Size of data record is not the length of a control data record"))
+                                                                        "Throwing RecoverableSampleException, Size of data record is not the length of a control data record"))
         else:
             log.debug("PhsenAbcdefDclParser._process_instrument_data(): "
-                      "Record is neither instrument or control, throwing exception")
+                      "Throwing RecoverableSampleException, Record is neither instrument or control")
 
             self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser._process_instrument_data(): "
                                                                 "Data Type is neither Control or Instrument"))
@@ -691,6 +779,7 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
         ## convert to a 16 bit unsigned int
         type_int = int(type_ascii_hex, 16)
 
+        ## Type checks, per values defiend in the IDD
         if type_int == 10:
             log.debug("PhsenAbcdefDclParser._determine_data_type(): dataType is %s, INSTRUMENT", type_int)
             return dataTypeEnum.INSTRUMENT
@@ -756,7 +845,7 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
 
                             ## clear out the working record (the last string that was being built)
                             log.debug(" ## PhsenAbcdefDclParser.parse_chunks(): "
-                                      "### ### ### CLEARING WORKING RECORD ### ### ###")
+                                      "### ### ### _process_instrument_data called, CLEARING WORKING RECORD ### ### ###")
 
                             self.working_record = ""
 
@@ -778,6 +867,22 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                         ## save off the DLC time
                         stripped_logfile_line = self._strip_logfile_line(chunk)
 
+                        ## the working record should be empty when a new star is found
+                        if len(self.working_record) > 0:
+                            ## clear the working record, it must contain bad or start of day data
+                            ## clear out the working record (the last string that was being built)
+                            log.debug(" ## PhsenAbcdefDclParser.parse_chunks(): "
+                                      "### ### ### incomplete/bad data, CLEARING WORKING RECORD ### ### ###")
+                            self.working_record = ""
+
+                            log.debug("PhsenAbcdefDclParser.parse_chunks(): "
+                                      "found a new star but working_record is non-zero length, "
+                                      "throwing a RecoverableSample exception")
+                            self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser.parse_chunks(): "
+                                                                                "found a new record to parse but "
+                                                                                "working_record is non-zero length, "
+                                                                                "throwing a RecoverableSample exception"))
+
                         ## append time_stripped_logfile_line to working_record
                         self.working_record += stripped_logfile_line
 
@@ -798,12 +903,25 @@ class PhsenAbcdefDclParser(BufferLoadingParser):
                         ## append time_stripped_logfile_line to working_record
                         self.working_record += stripped_logfile_line
 
+
+
             # collect the non-data from the file
             (nd_timestamp, non_data, non_start, non_end) = self._chunker.get_next_non_data_with_index(clean=False)
             # collect the data from the file
             (timestamp, chunk, start, end) = self._chunker.get_next_data_with_index(clean=True)
 
             self.handle_non_data(non_data, non_end, start)
+
+        ## Per the IDD, it is possible for a single instrument data record to span multiple files, when the record is
+        ## being written out as the day changes. Since the software architecture does not support parsing a single
+        ## particle from multiple files, a recoverable sample exception should be issued in this case.
+        if len(self.working_record) > 0:
+            log.debug("PhsenAbcdefDclParser.parse_chunks(): "
+                      "working_record is non-zero length, throwing a RecoverableSample exception")
+
+            self._exception_callback(RecoverableSampleException("PhsenAbcdefDclParser.parse_chunks(): "
+                                                                "working_record is non-zero length, "
+                                                                "throwing a RecoverableSample exception"))
 
         # publish the results
         return self.result_particle_list
